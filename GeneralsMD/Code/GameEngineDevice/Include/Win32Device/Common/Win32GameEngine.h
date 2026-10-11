@@ -37,6 +37,11 @@
 #include "GameLogic/GameLogic.h"
 #include "GameNetwork/NetworkInterface.h"
 #include "MilesAudioDevice/MilesAudioManager.h"
+#if defined(__APPLE__)
+#include "MacOSAudioDevice/MacOSAudioManager.h"
+#include <cstdlib>
+#include <cstring>
+#endif
 #include "Win32Device/Common/Win32BIGFileSystem.h"
 #include "Win32Device/Common/Win32LocalFileSystem.h"
 #include "W3DDevice/Common/W3DModuleFactory.h"
@@ -113,5 +118,15 @@ inline AudioManager *Win32GameEngine::createAudioManager(Bool dummy)
 {
 	if (dummy)
 		return NEW MilesAudioManagerDummy;
+#if defined(__APPLE__)
+	// TheSuperHackers @port macOS @feature: the AVAudioEngine audio manager
+	// (ported from OKJID's macOS port) is the default. GEN_AUDIO=miles selects
+	// the Miles API shim (cmake/miles_apple) instead.
+	{
+		const char *audio = ::getenv("GEN_AUDIO");
+		if (!(audio && ::strcmp(audio, "miles") == 0))
+			return NEW MacOSAudioManager;
+	}
+#endif
 	return NEW MilesAudioManager;
 }

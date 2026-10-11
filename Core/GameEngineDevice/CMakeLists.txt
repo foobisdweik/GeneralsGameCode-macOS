@@ -230,6 +230,40 @@ target_link_libraries(corei_gameenginedevice_public INTERFACE
     milesstub
 )
 
+# TheSuperHackers @port macOS: AVAudioEngine audio device (ported from OKJID's
+# macOS port). Win32GameEngine::createAudioManager selects it on macOS.
+if(APPLE)
+    target_sources(corei_gameenginedevice_private INTERFACE
+        Include/MacOSAudioDevice/AdpcmWavDecoder.h
+        Include/MacOSAudioDevice/AVAudioBridge.h
+        Include/MacOSAudioDevice/MacOSAudioCompat.h
+        Include/MacOSAudioDevice/MacOSAudioManager.h
+        Include/MacOSAudioDevice/MacOSVideoAudioStream.h
+        Source/MacOSAudioDevice/AdpcmWavDecoder.cpp
+        Source/MacOSAudioDevice/MacOSAudioManager.cpp
+    )
+
+    # The Objective-C++ side is its own library: the engine's precompiled header
+    # cannot be included into Objective-C++ (MacTypes.h and objc.h conflict with
+    # the engine's Byte and BOOL typedefs). It is written for ARC.
+    add_library(macosaudiobridge STATIC
+        Source/MacOSAudioDevice/AVAudioBridge.mm
+        Source/MacOSAudioDevice/MacOSVideoAudioStream.mm
+    )
+    target_include_directories(macosaudiobridge PRIVATE
+        Include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../GameEngine/Include
+    )
+    target_compile_options(macosaudiobridge PRIVATE -fobjc-arc)
+    target_link_libraries(macosaudiobridge PUBLIC
+        "-framework AVFoundation"
+        "-framework AudioToolbox"
+        "-framework CoreAudio"
+        "-framework AppKit"
+    )
+    target_link_libraries(corei_gameenginedevice_public INTERFACE macosaudiobridge)
+endif()
+
 if(RTS_BUILD_OPTION_FFMPEG)
     find_package(FFMPEG REQUIRED)
 

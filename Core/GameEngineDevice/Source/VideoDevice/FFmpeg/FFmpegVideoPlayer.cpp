@@ -51,6 +51,12 @@ extern "C" {
 #include "OpenALAudioDevice/OpenALAudioStream.h"
 #endif
 
+#ifdef __APPLE__
+// TheSuperHackers @port macOS: video soundtracks go to the AVAudioEngine audio
+// device through this interface (ported from OKJID's macOS port).
+#include "Common/IVideoAudioStream.h"
+#endif
+
 #include <chrono>
 
 //----------------------------------------------------------------------------
@@ -315,15 +321,20 @@ FFmpegVideoStream::FFmpegVideoStream(FFmpegFile* file)
 	// Release the audio handle if it's already in use
 	OpenALAudioStream* audioStream = (OpenALAudioStream*)TheAudio->getHandleForBink();
 	audioStream->reset();
+#elif defined(__APPLE__)
+	IVideoAudioStream* audioStream = GetVideoAudioStream();
+	if (audioStream) audioStream->reset();
 #endif
 
 	// Decode until we have our first video frame
 	while (m_good && m_gotFrame == false)
 		m_good = m_ffmpegFile->decodePacket();
 
- #ifdef RTS_USE_OPENAL
+#ifdef RTS_USE_OPENAL
 	// Start audio playback
 	audioStream->play();
+#elif defined(__APPLE__)
+	if (audioStream) audioStream->play();
 #endif
 
 	m_startTime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -384,6 +395,41 @@ void FFmpegVideoStream::onFrame(AVFrame *frame, int stream_idx, int stream_type,
 		ALenum format = OpenALAudioManager::getALFormat(frame->ch_layout.nb_channels, bytesPerSample * 8);
 		audioStream->bufferData(frameData, frameSize, format, frame->sample_rate);
 	}
+#elif defined(__APPLE__)
+	else if (stream_type == AVMEDIA_TYPE_AUDIO) {
+		IVideoAudioStream* audioStream = GetVideoAudioStream();
+		if (!audioStream) return;
+		audioStream->update();
+		AVSampleFormat sampleFmt = static_cast<AVSampleFormat>(frame->format);
+		const int bytesPerSample = av_get_bytes_per_sample(sampleFmt);
+		const int frameSize = av_samples_get_buffer_size(nullptr, frame->ch_layout.nb_channels, frame->nb_samples, sampleFmt, 1);
+		uint8_t* frameData = frame->data[0];
+
+		// The format is planar - convert it to interleaved
+		if (av_sample_fmt_is_planar(sampleFmt))
+		{
+			videoStream->m_audioBuffer = static_cast<uint8_t*>(av_realloc(videoStream->m_audioBuffer, frameSize));
+			if (videoStream->m_audioBuffer == nullptr)
+			{
+				DEBUG_LOG(("Failed to allocate audio buffer"));
+				return;
+			}
+
+			for (int sample_idx = 0; sample_idx < frame->nb_samples; sample_idx++)
+			{
+				int byte_offset = sample_idx * bytesPerSample;
+				for (int channel_idx = 0; channel_idx < frame->ch_layout.nb_channels; channel_idx++)
+				{
+					uint8_t* dst = &videoStream->m_audioBuffer[byte_offset * frame->ch_layout.nb_channels + channel_idx * bytesPerSample];
+					uint8_t* src = &frame->data[channel_idx][byte_offset];
+					memcpy(dst, src, bytesPerSample);
+				}
+			}
+			frameData = videoStream->m_audioBuffer;
+		}
+
+		audioStream->bufferData(frameData, frameSize, frame->ch_layout.nb_channels, bytesPerSample * 8, frame->sample_rate);
+	}
 #endif
 }
 
@@ -398,6 +444,9 @@ void FFmpegVideoStream::update()
 	// Start audio playback
 	OpenALAudioStream* audioStream = (OpenALAudioStream*)TheAudio->getHandleForBink();
 	audioStream->play();
+#elif defined(__APPLE__)
+	IVideoAudioStream* audioStream = GetVideoAudioStream();
+	if (audioStream) audioStream->update();
 #endif
 	//BinkWait( m_handle );
 }
