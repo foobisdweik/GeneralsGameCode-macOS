@@ -88,7 +88,8 @@ final class LauncherModel: ObservableObject {
     @Published var gameRunning: Bool = false
     @Published var lastError: String? = nil
 
-    private var gameProcess: Process?
+    private var gameApp: NSRunningApplication?
+    private var gameExitObserver: NSObjectProtocol?
 
     var dataDirIsValid: Bool {
         guard !dataDirPath.isEmpty else { return false }
@@ -359,12 +360,12 @@ final class LauncherModel: ObservableObject {
 
     /// Force-closes the running game: SIGTERM, then SIGKILL after a short grace.
     func stop() {
-        guard let proc = gameProcess, proc.isRunning else { return }
-        let pid = proc.processIdentifier
+        guard let app = gameApp, !app.isTerminated else { return }
+        let pid = app.processIdentifier
         status = "Stopping game…"
-        proc.terminate()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-            if proc.isRunning { kill(pid, SIGKILL) }
+        kill(pid, SIGTERM)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            if !app.isTerminated { kill(pid, SIGKILL) }
         }
     }
 
@@ -533,7 +534,7 @@ final class LauncherModel: ObservableObject {
                 if !engineInstalled {
                     try await installEngine()
                 }
-                try launchGame(dataDir: dataDir)
+                try await launchGame(dataDir: dataDir)
                 status = willUseMod ? "Game launched (mod)." : "Game launched."
             } catch {
                 fail(error)
@@ -638,19 +639,19 @@ final class LauncherModel: ObservableObject {
 
     // MARK: - Launch
 
-    private func launchGame(dataDir: URL) throws {
+    private func launchGame(dataDir: URL) async throws {
         ensureUserDataDefaults()
 
-        let proc = Process()
-        proc.executableURL = Config.runtimeBinary
-        // The engine finds its .big archives relative to the working directory
-        // (StdBIGFileSystem loads "*.big" from "."), so the game folder is passed
-        // as the cwd, not a flag.
-        proc.currentDirectoryURL = dataDir
-        // Windowed mode is the engine's -win command-line flag; fullscreen is the
-        // default (no flag).
-        proc.arguments = fullscreen ? [] : ["-win"]
+        // Launch the engine as an app bundle through LaunchServices, not with
+        // Process(): macOS only recognises a LaunchServices-launched app with a
+        // game category as a game, which Game Mode requires (see GameBundle).
+        let bundle = try GameBundle.ensure()
+
         var env = ProcessInfo.processInfo.environment
+        // The engine finds its .big archives relative to the working directory
+        // (StdBIGFileSystem loads "*.big" from "."). A LaunchServices launch
+        // starts in "/", so the engine changes into GEN_DATA_DIR first (main()).
+        env["GEN_DATA_DIR"] = dataDir.path
         // Apply the mod via the engine's macOS env-var hooks (see GameEngine.cpp):
         // a file -> GEN_MOD (m_modBIG), a folder -> GEN_MOD_DIR (m_modDir).
         env.removeValue(forKey: "GEN_MOD")
@@ -679,16 +680,40 @@ final class LauncherModel: ObservableObject {
         // Cmd+A/S/D (HotKey.cpp) so nothing is lost from the keyboard.
         env.removeValue(forKey: "GEN_WASD_CAMERA")
         if wasdCamera { env["GEN_WASD_CAMERA"] = "1" }
-        proc.environment = env
-        proc.terminationHandler = { [weak self] _ in
-            Task { @MainActor in
-                self?.gameRunning = false
-                self?.status = "Game exited."
-            }
-        }
-        try proc.run()
-        gameProcess = proc
+
+        let config = NSWorkspace.OpenConfiguration()
+        // Windowed mode is the engine's -win command-line flag; fullscreen is the
+        // default (no flag).
+        config.arguments = fullscreen ? [] : ["-win"]
+        config.environment = env
+        config.createsNewApplicationInstance = true
+        config.activates = true
+
+        let app = try await NSWorkspace.shared.openApplication(at: bundle, configuration: config)
+        gameApp = app
         gameRunning = true
+        // Watch for the exit through NSWorkspace rather than KVO on the
+        // NSRunningApplication: releasing the app object from inside its own
+        // isTerminated observer deallocates it while the observer is attached.
+        let pid = app.processIdentifier
+        gameExitObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            let ended = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard ended?.processIdentifier == pid else { return }
+            Task { @MainActor in self?.gameDidExit() }
+        }
+    }
+
+    private func gameDidExit() {
+        if let observer = gameExitObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            gameExitObserver = nil
+        }
+        gameApp = nil
+        gameRunning = false
+        status = "Game exited."
     }
 }
 

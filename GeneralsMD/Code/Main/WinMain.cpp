@@ -999,6 +999,17 @@ int main(int argc, char* argv[])
 {
 	(void)argc;
 	(void)argv;
+#if defined(__APPLE__)
+	// TheSuperHackers @port macOS @feature: the engine loads its .big archives from
+	// the working directory. An app launched through LaunchServices starts in "/",
+	// so GEN_DATA_DIR names the game data folder to change into first. This lets
+	// the game binary be the app bundle's own executable, which macOS needs to
+	// identify the process as a game (Game Mode).
+	if (const char *dataDir = ::getenv("GEN_DATA_DIR"); dataDir && dataDir[0] != '\0') {
+		if (::chdir(dataDir) != 0)
+			fprintf(stderr, "GEN_DATA_DIR: cannot change into '%s'\n", dataDir);
+	}
+#endif
 	int exitcode = WinMain(nullptr, nullptr, (LPSTR)"", 0 /*SW_HIDE*/);
 
 	// The engine already tore itself down inside WinMain (shutdownMemoryManager,
