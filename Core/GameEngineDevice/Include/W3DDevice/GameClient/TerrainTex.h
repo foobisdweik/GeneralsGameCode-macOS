@@ -35,7 +35,8 @@
 #include "Common/AsciiString.h"
 
 class WorldHeightMap;
-#define TILE_OFFSET 8
+#include "W3DDevice/GameClient/TileData.h"
+#define TILE_OFFSET (8*TILE_SCALE) // border between atlas tiles; scales with the tile size
 /** ***********************************************************************
 **                             TerrainTextureClass
 ***************************************************************************/

@@ -45,17 +45,21 @@ typedef struct {
 
 #define INVERTED_MASK	0x1		//AND this with TBlendTileInfo.inverted to get actual inverted state
 #define FLIPPED_MASK	0x2		//AND this with TBlendTileInfo.inverted to get forced flip state (for horizontal/vertical flips).
-#define TILE_PIXEL_EXTENT 64
+// TheSuperHackers @port macOS: terrain and tree tiles are stored at
+// TILE_SCALE times the original 64 px, so 2x-upscaled terrain art keeps its
+// detail. Source images stay laid out in 64 px tiles (TILE_NATIVE_EXTENT);
+// WorldHeightMap::readTiles upsamples them unless the TGA image ID carries
+// TILE_HIRES_TGA_ID, which marks art that is already at TILE_PIXEL_EXTENT.
+// The atlas layout (tiles per row) is unchanged; only its pixel size scales.
+#define TILE_SCALE 2
+#define TILE_NATIVE_EXTENT 64
+#define TILE_HIRES_TGA_ID "GZH_TILE128"
+#define TILE_PIXEL_EXTENT (TILE_NATIVE_EXTENT*TILE_SCALE)
 #define TILE_BYTES_PER_PIXEL 4
 #define DATA_LEN_BYTES TILE_PIXEL_EXTENT*TILE_PIXEL_EXTENT*TILE_BYTES_PER_PIXEL
 #define DATA_LEN_PIXELS TILE_PIXEL_EXTENT*TILE_PIXEL_EXTENT
-#define TILE_PIXEL_EXTENT_MIP1 32
-#define TILE_PIXEL_EXTENT_MIP2 16
-#define TILE_PIXEL_EXTENT_MIP3 8
-#define TILE_PIXEL_EXTENT_MIP4 4
-#define TILE_PIXEL_EXTENT_MIP5 2
-#define TILE_PIXEL_EXTENT_MIP6 1
-#define TEXTURE_WIDTH 2048 // was 1024 jba
+#define TILE_NUM_MIPS 7 // levels below TILE_PIXEL_EXTENT, down to 1x1
+#define TEXTURE_WIDTH (2048*TILE_SCALE) // was 1024 jba
 
 /** This class holds the bitmap data from the .tga texture files.  It is used to
 create the D3D texture in the game and 3d windows, and to create DIB data for the
@@ -68,13 +72,10 @@ protected:
 	// Also, first byte is lower left pixel, not upper left pixel.
 	// so 0,0 is lower left, not upper left.
 	UnsignedByte m_tileData[DATA_LEN_BYTES];
-	/// Mipped down copies of the tile data.
-	UnsignedByte m_tileDataMip32[TILE_PIXEL_EXTENT_MIP1*TILE_PIXEL_EXTENT_MIP1*TILE_BYTES_PER_PIXEL];
-	UnsignedByte m_tileDataMip16[TILE_PIXEL_EXTENT_MIP2*TILE_PIXEL_EXTENT_MIP2*TILE_BYTES_PER_PIXEL];
-	UnsignedByte m_tileDataMip8[TILE_PIXEL_EXTENT_MIP3*TILE_PIXEL_EXTENT_MIP3*TILE_BYTES_PER_PIXEL];
-	UnsignedByte m_tileDataMip4[TILE_PIXEL_EXTENT_MIP4*TILE_PIXEL_EXTENT_MIP4*TILE_BYTES_PER_PIXEL];
-	UnsignedByte m_tileDataMip2[TILE_PIXEL_EXTENT_MIP5*TILE_PIXEL_EXTENT_MIP5*TILE_BYTES_PER_PIXEL];
-	UnsignedByte m_tileDataMip1[TILE_PIXEL_EXTENT_MIP6*TILE_PIXEL_EXTENT_MIP6*TILE_BYTES_PER_PIXEL];
+	/// Mipped down copies of the tile data, (TILE_PIXEL_EXTENT>>(k+1))^2 pixels
+	/// each, packed back to back. Total is less than a third of DATA_LEN_BYTES.
+	UnsignedByte m_tileDataMips[DATA_LEN_BYTES/3];
+	UnsignedByte *mipPtr(Int k);
 
 public:
 	ICoord2D	m_tileLocationInTexture;

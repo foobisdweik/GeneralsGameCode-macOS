@@ -69,7 +69,7 @@ texture of the desired height and mip level. */
 //=============================================================================
 TerrainTextureClass::TerrainTextureClass(int height) :
 	TextureClass(TEXTURE_WIDTH, height,
-		WW3D_FORMAT_A1R5G5B5, MIP_LEVELS_3 )
+		WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_3 )
 {
 }
 
@@ -117,7 +117,8 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	//DEBUG_ASSERTCRASH(tilesPerRow*numRows >= htMap->m_numBitmapTiles, ("Too many tiles."));
 	DEBUG_ASSERTCRASH((Int)surface_desc.Width >= tilePixelExtent*tilesPerRow, ("Bitmap too small."));
 #endif
-	if (surface_desc.Format == D3DFMT_A1R5G5B5) {
+	const Bool is32 = (surface_desc.Format == D3DFMT_A8R8G8B8);
+	if (surface_desc.Format == D3DFMT_A1R5G5B5 || is32) {
 #if 0
 		UnsignedInt cellX, cellY;
 		for (cellX = 0; cellX < surface_desc.Width; cellX++) {
@@ -128,7 +129,8 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 		}
 #endif
 		Int tileNdx;
-		Int pixelBytes = 2;
+		Int pixelBytes = is32 ? 4 : 2;
+		const Int border = TILE_OFFSET/2;
 		for (tileNdx=0; tileNdx < htMap->m_numBitmapTiles; tileNdx++) {
 			TileData *pTile = htMap->getSourceTile(tileNdx);
 			if (!pTile) continue;
@@ -146,20 +148,24 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 				Int column = position.x;
 				pBGRX += column*pixelBytes;
 				for (i=0; i<tilePixelExtent; i++) {
-					*((Short*)pBGRX) = 0x8000 + ((pBGR[2]>>3)<<10) + ((pBGR[1]>>3)<<5) + (pBGR[0]>>3);
+					if (is32) {
+						*((UnsignedInt*)pBGRX) = 0xFF000000 | (pBGR[2]<<16) | (pBGR[1]<<8) | pBGR[0];
+					} else {
+						*((Short*)pBGRX) = 0x8000 + ((pBGR[2]>>3)<<10) + ((pBGR[1]>>3)<<5) + (pBGR[0]>>3);
+					}
 					pBGRX +=pixelBytes;
 					pBGR +=TILE_BYTES_PER_PIXEL;
 				}
 			}
 		}
-		// Now draw the 4 pixel border around each tile class.
+		// Now draw the border (TILE_OFFSET/2 pixels) around each tile class.
 		Int texClass;
 		for (texClass=0; texClass<htMap->m_numTextureClasses; texClass++) {
 			Int width = htMap->m_textureClasses[texClass].width;
 			ICoord2D origin = htMap->m_textureClasses[texClass].positionInTexture;
 			if (origin.x<=0) continue;
 			width *= TILE_PIXEL_EXTENT;
-			// Duplicate 4 columns of pixels before and after.
+			// Duplicate border columns of pixels before and after.
 			Int j;
 			for (j=0; j<width; j++) {
 				Int row = origin.y+j;
@@ -169,25 +175,25 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 				Int column = origin.x;
 				pBGRX += column*pixelBytes;
 				// copy before
-				memcpy(pBGRX-(4)*pixelBytes, pBGRX+(width-4)*pixelBytes, 4*pixelBytes);
+				memcpy(pBGRX-(border)*pixelBytes, pBGRX+(width-border)*pixelBytes, border*pixelBytes);
 				// copy after
-				memcpy(pBGRX+(width*pixelBytes), pBGRX, 4*pixelBytes);
+				memcpy(pBGRX+(width*pixelBytes), pBGRX, border*pixelBytes);
 			}
 
-			// Duplicate 4 rows of pixels before and after.
-			for (j=0; j<4; j++) {
+			// Duplicate border rows of pixels before and after.
+			for (j=0; j<border; j++) {
 				// copy before.
 				Int row = origin.y-j-1;
 				UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) +
 							(row)*surface_desc.Width*pixelBytes;
-				UnsignedByte *target = pBGRX+(origin.x-4)*pixelBytes;
-				memcpy(target, target+width*surface_desc.Width*pixelBytes, (width+8)*pixelBytes);
+				UnsignedByte *target = pBGRX+(origin.x-border)*pixelBytes;
+				memcpy(target, target+width*surface_desc.Width*pixelBytes, (width+2*border)*pixelBytes);
 				// copy after.
 				row = origin.y+j;
 				pBGRX = ((UnsignedByte*)locked_rect.pBits) +
 							(row)*surface_desc.Width*pixelBytes;
-				target = pBGRX+(origin.x-4)*pixelBytes;
-				memcpy(target+width*surface_desc.Width*pixelBytes, target, (width+8)*pixelBytes);
+				target = pBGRX+(origin.x-border)*pixelBytes;
+				memcpy(target+width*surface_desc.Width*pixelBytes, target, (width+2*border)*pixelBytes);
 			}
 
 		}

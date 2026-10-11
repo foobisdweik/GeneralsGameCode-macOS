@@ -53,6 +53,9 @@
 
 #include "Common/file.h"
 
+#include <cmath>
+#include <vector>
+
 
 #define K_OBSOLETE_HEIGHT_MAP_VERSION 8
 
@@ -1301,6 +1304,23 @@ typedef struct {
 
 
 
+/// Reads the TGA image ID that follows the header. Returns true when the ID
+/// marks art already authored at TILE_PIXEL_EXTENT (see TileData.h).
+static Bool readTargaHiResId(InputStream *pStr, const TTargaHeader &hdr)
+{
+	char id[256];
+	Int len = hdr.idLength;
+	if (len > 0 && pStr->read(id, len) != len) return false;
+	id[len] = 0;
+	return strcmp(id, TILE_HIRES_TGA_ID) == 0;
+}
+
+/// Pixel size of one tile in the source image.
+static Int targaTileExtent(Bool hiRes)
+{
+	return hiRes ? TILE_PIXEL_EXTENT : TILE_NATIVE_EXTENT;
+}
+
 /// Count how many tiles come in from a targa file.
 Int WorldHeightMap::countTiles(InputStream *pStr, Bool *halfTile)
 {
@@ -1310,8 +1330,9 @@ Int WorldHeightMap::countTiles(InputStream *pStr, Bool *halfTile)
 	}
 	Int len = pStr->read(&hdr,sizeof(hdr));
 	if (len!=sizeof(hdr)) return(0);
-	Int tileWidth = hdr.imageWidth/TILE_PIXEL_EXTENT;
-	Int tileHeight = hdr.imageHeight/TILE_PIXEL_EXTENT;
+	const Int extent = targaTileExtent(readTargaHiResId(pStr, hdr));
+	Int tileWidth = hdr.imageWidth/extent;
+	Int tileHeight = hdr.imageHeight/extent;
 
 	if (hdr.colorMapType != 0) {
 		return(0); // we don't do indexed at this time. jba.
@@ -1337,91 +1358,128 @@ Int WorldHeightMap::countTiles(InputStream *pStr, Bool *halfTile)
 	if (tileWidth>=3 && tileHeight >=3) return(9);
 	if (tileWidth>=2 && tileHeight >=2) return(4);
 	if (tileWidth>=1 && tileHeight >=1) return(1);
-	if (halfTile && hdr.imageHeight==TILE_PIXEL_EXTENT/2 && hdr.imageWidth==TILE_PIXEL_EXTENT/2) {
+	if (halfTile && hdr.imageHeight==extent/2 && hdr.imageWidth==extent/2) {
 		*halfTile = true;
 		return 1;
 	}
 	return(0);
 }
+
+/// Decodes the TGA pixel data (rows in file order) into BGRA.
+static Bool decodeTargaPixels(InputStream *pStr, const TTargaHeader &hdr, std::vector<UnsignedByte> &out)
+{
+	const Int bytesPerPixel = (hdr.pixelDepth+7)/8;
+	if (bytesPerPixel < 3 || bytesPerPixel > 4) return false;
+	const Bool compressed = (hdr.imageType & 0x08) != 0;
+	const Int numPixels = hdr.imageWidth*hdr.imageHeight;
+	out.assign((size_t)numPixels*TILE_BYTES_PER_PIXEL, 0);
+	UnsignedByte buf[4] = {0, 0, 0, 255};
+	Int repeatCount = 0;
+	Bool running = false;
+	for (Int i = 0; i < numPixels; i++) {
+		if (compressed && repeatCount==0) {
+			UnsignedByte flag;
+			pStr->read(&flag, 1);
+			repeatCount = (flag&0x7f) + 1;
+			running = (flag&0x80) != 0;
+			if (running) {
+				pStr->read(buf, bytesPerPixel);
+			}
+		}
+		if (compressed) repeatCount--;
+		if (!running) {
+			pStr->read(buf, bytesPerPixel);
+		}
+		UnsignedByte *pixel = &out[(size_t)i*TILE_BYTES_PER_PIXEL];
+		pixel[0] = buf[0];
+		pixel[1] = buf[1];
+		pixel[2] = buf[2];
+		pixel[3] = (bytesPerPixel==4) ? buf[3] : 255; // solid alpha.
+	}
+	DEBUG_ASSERTCRASH(repeatCount==0, ("Invalid tga."));
+	return true;
+}
+
+/// Bilinear upsample by TILE_SCALE with wrap-around edges, so tiling art
+/// stays seamless.
+static void upsampleTilePixels(const std::vector<UnsignedByte> &src, Int w, Int h, std::vector<UnsignedByte> &dst)
+{
+	const Int dw = w*TILE_SCALE, dh = h*TILE_SCALE;
+	dst.assign((size_t)dw*dh*TILE_BYTES_PER_PIXEL, 0);
+	for (Int y = 0; y < dh; y++) {
+		Real fy = (y + 0.5f)/TILE_SCALE - 0.5f;
+		Int y0 = (Int)floorf(fy);
+		Real ty = fy - y0;
+		Int ya = (y0 % h + h) % h, yb = ((y0+1) % h + h) % h;
+		for (Int x = 0; x < dw; x++) {
+			Real fx = (x + 0.5f)/TILE_SCALE - 0.5f;
+			Int x0 = (Int)floorf(fx);
+			Real tx = fx - x0;
+			Int xa = (x0 % w + w) % w, xb = ((x0+1) % w + w) % w;
+			const UnsignedByte *p00 = &src[((size_t)ya*w+xa)*TILE_BYTES_PER_PIXEL];
+			const UnsignedByte *p10 = &src[((size_t)ya*w+xb)*TILE_BYTES_PER_PIXEL];
+			const UnsignedByte *p01 = &src[((size_t)yb*w+xa)*TILE_BYTES_PER_PIXEL];
+			const UnsignedByte *p11 = &src[((size_t)yb*w+xb)*TILE_BYTES_PER_PIXEL];
+			UnsignedByte *d = &dst[((size_t)y*dw+x)*TILE_BYTES_PER_PIXEL];
+			for (Int c = 0; c < TILE_BYTES_PER_PIXEL; c++) {
+				Real top = p00[c] + (p10[c]-p00[c])*tx;
+				Real bot = p01[c] + (p11[c]-p01[c])*tx;
+				d[c] = (UnsignedByte)(top + (bot-top)*ty + 0.5f);
+			}
+		}
+	}
+}
+
 /*Break down a .tga file into a collection of tiles.  numRows * numRows total tiles.*/
 Bool WorldHeightMap::readTiles(InputStream *pStr, TileData **tiles, Int numRows)
 {
 	TTargaHeader hdr;
 	pStr->read(&hdr, sizeof(hdr));
-	Int tileWidth = hdr.imageWidth/TILE_PIXEL_EXTENT;
-	Int tileHeight = hdr.imageHeight/TILE_PIXEL_EXTENT;
+	const Bool hiRes = readTargaHiResId(pStr, hdr);
+	const Int extent = targaTileExtent(hiRes);
+	Int tileWidth = hdr.imageWidth/extent;
+	Int tileHeight = hdr.imageHeight/extent;
 
-	if (hdr.imageHeight==TILE_PIXEL_EXTENT/2) {
+	if (hdr.imageHeight==extent/2) {
 		tileHeight = 1;
 	}
-	if (hdr.imageWidth==TILE_PIXEL_EXTENT/2) {
+	if (hdr.imageWidth==extent/2) {
 		tileWidth = 1;
 	}
 
 	if (tileWidth<numRows && tileHeight<numRows) {
 		return(false);
 	}
-	Bool compressed = false;
-	if (hdr.imageType & 0x08) {
-		compressed = true;
+	std::vector<UnsignedByte> pixels;
+	if (!decodeTargaPixels(pStr, hdr, pixels)) return(false);
+	Int imageWidth = hdr.imageWidth;
+	Int imageHeight = hdr.imageHeight;
+	if (!hiRes && TILE_SCALE > 1) {
+		std::vector<UnsignedByte> scaled;
+		upsampleTilePixels(pixels, imageWidth, imageHeight, scaled);
+		pixels.swap(scaled);
+		imageWidth *= TILE_SCALE;
+		imageHeight *= TILE_SCALE;
 	}
-	int row = 0;
-	int column = 0;
-	int bytesPerPixel = (hdr.pixelDepth+7)/8;
-	if (bytesPerPixel < 3) return(false);
-	if (bytesPerPixel > 4) return(false);
 	int i;
 	for (i=0; i<numRows*numRows; i++) {
 		if (tiles[i] == nullptr)
 			tiles[i] = MSGNEW("WorldHeightMap_readTiles") TileData;
 	}
-	UnsignedByte buf[4];
-	int repeatCount = 0;
-//	Bool read = false;
-	Bool running = false;
-	for (row = 0; row < numRows*TILE_PIXEL_EXTENT; row++) {
-		for (column=0; column<hdr.imageWidth; column++) {
-			UnsignedByte r, g, b, a;
-			if (row < hdr.imageHeight) {
-				if (compressed && repeatCount==0) {
-					UnsignedByte flag;
-					pStr->read(&flag, 1);
-					repeatCount = flag&0x7f;
-					repeatCount++;
-					if (flag&0x80) {
-						running = true;
-						pStr->read(buf, bytesPerPixel);
-					} else {
-						running = false;
-					}
-				}
-				if (compressed) repeatCount--;
-				if (!running) {
-					pStr->read(buf, bytesPerPixel);
-				}
-				r = buf[2]; g = buf[1]; b = buf[0];
-				if (bytesPerPixel==4) {
-					a = buf[3];
-				} else {
-					a = 255;// solid alpha.
-				}
-			} else {
-				r = g = b = a = 0;
-			}
+	for (int row = 0; row < numRows*TILE_PIXEL_EXTENT; row++) {
+		for (int column=0; column<imageWidth; column++) {
 			if (column >= (numRows*TILE_PIXEL_EXTENT)) continue;
 			int tileNdx = (column/TILE_PIXEL_EXTENT) + numRows*(row/TILE_PIXEL_EXTENT);
 			int pixelNdx = (column%TILE_PIXEL_EXTENT) + TILE_PIXEL_EXTENT*(row%TILE_PIXEL_EXTENT);
 
 			UnsignedByte *pixel = tiles[tileNdx]->getDataPtr();
-
 			pixel += pixelNdx*TILE_BYTES_PER_PIXEL;
-			*pixel++ = b;
-			*pixel++ = g;
-			*pixel++ = r;
-			*pixel = a;
-
+			if (row < imageHeight) {
+				memcpy(pixel, &pixels[((size_t)row*imageWidth+column)*TILE_BYTES_PER_PIXEL], TILE_BYTES_PER_PIXEL);
+			} else {
+				memset(pixel, 0, TILE_BYTES_PER_PIXEL);
+			}
 		}
-		DEBUG_ASSERTCRASH(repeatCount==0, ("Invalid tga."));
 	}
 	for (i=0; i<numRows*numRows; i++) {
 		tiles[i]->updateMips();

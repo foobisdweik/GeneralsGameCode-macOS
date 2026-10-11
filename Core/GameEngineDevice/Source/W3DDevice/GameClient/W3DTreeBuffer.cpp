@@ -434,7 +434,7 @@ public:
 void W3DTreeBuffer::updateTexture()
 {
 
-	const Int MAX_TEX_WIDTH = 2048;
+	const Int MAX_TEX_WIDTH = 2048*TILE_SCALE;
 
 	Int i, j;
 	Int maxHeight = 0;
