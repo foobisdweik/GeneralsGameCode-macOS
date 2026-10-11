@@ -36,6 +36,18 @@
 
 #include "GameNetwork/LANAPICallbacks.h"
 
+#if defined(__APPLE__)
+#include "Common/GlobalData.h"
+#include "GameClient/Display.h"
+#include "GameClient/GameWindowTransitions.h"
+#include "GameClient/HeaderTemplate.h"
+#include "GameClient/InGameUI.h"
+#include "GameClient/Mouse.h"
+#include "GameClient/Shell.h"
+#include "GameClient/View.h"
+#include "GameLogic/GameLogic.h"
+#endif
+
 extern DWORD TheMessageTime;
 
 //-------------------------------------------------------------------------------------------------
@@ -171,11 +183,74 @@ static void Apple_PumpMouseInput()
 		TheWin32Mouse->addWin32Event(msg, wParam, lParam, 0);
 	}
 }
+
+// TheSuperHackers @port macOS @feature: the engine resolution follows the
+// window. The Metal backend posts a request when the window settles at a new
+// pixel size (user resize, native fullscreen enter/exit, move to a display with
+// another backing scale). It is applied here, before update and draw, because a
+// resolution change resets the device. The follow-up work matches what the
+// Options menu does after a resolution change.
+extern "C" int MetalWindow_TakeResizeRequest(int* width, int* height, int* fullscreen);
+static void Apple_PumpWindowState()
+{
+	// Display::setDisplayMode needs the tactical view, which GameClient::init
+	// creates after the display. Leave the request pending until then.
+	if (!TheDisplay || !TheTacticalView || !TheWritableGlobalData)
+		return;
+
+	// Recreating the shell layouts while a menu transition is running leaves the
+	// menu buttons hidden. Wait until the transition has finished.
+	if (TheTransitionHandler && !TheTransitionHandler->isFinished())
+		return;
+
+	// Never change the resolution during a match. The stock game only allows it
+	// from the shell (the Options menu disables the resolution list in-game),
+	// and doing it here ended a running skirmish. The request stays pending and
+	// is applied when the player is back in the shell. Until then the backend
+	// scales the current frame into the window.
+	if (TheGameLogic && TheGameLogic->isInGame() && !TheGameLogic->isInShellGame())
+		return;
+
+	int width = 0, height = 0, fullscreen = 0;
+	if (!MetalWindow_TakeResizeRequest(&width, &height, &fullscreen))
+		return;
+
+	// Display::setDisplayMode does not store the windowed flag, so set it here.
+	const Bool windowed = fullscreen ? FALSE : TRUE;
+	TheDisplay->setWindowed(windowed);
+	TheWritableGlobalData->m_windowed = windowed;
+	if ((Int)TheDisplay->getWidth() == width && (Int)TheDisplay->getHeight() == height)
+		return;
+
+	if (!TheDisplay->setDisplayMode(width, height, TheDisplay->getBitDepth(), windowed))
+	{
+		DEBUG_LOG(("Apple_PumpWindowState: resolution change to %dx%d rejected", width, height));
+		return;
+	}
+
+	TheWritableGlobalData->m_xResolution = width;
+	TheWritableGlobalData->m_yResolution = height;
+
+	if (TheHeaderTemplateManager)
+		TheHeaderTemplateManager->onResolutionChanged();
+	if (TheMouse)
+		TheMouse->onResolutionChanged();
+	if (TheShell)
+		TheShell->recreateWindowLayouts();
+	if (TheInGameUI)
+	{
+		TheInGameUI->recreateControlBar();
+		TheInGameUI->refreshCustomUiResources();
+	}
+
+	DEBUG_LOG(("Apple_PumpWindowState: resolution now %dx%d, windowed=%d", width, height, (Int)windowed));
+}
 #endif
 
 void Win32GameEngine::serviceWindowsOS()
 {
 #if defined(__APPLE__)
+	Apple_PumpWindowState();
 	Apple_PumpMouseInput();
 #endif
 	MSG msg;

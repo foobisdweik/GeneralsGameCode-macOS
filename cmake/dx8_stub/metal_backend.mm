@@ -38,6 +38,32 @@ NSView*             g_inputView = nil;   // active content view, for coord conve
 // 2K+ on a smaller display). EventPoint linearly maps view-points → engine-pixels.
 int                 g_engineW = 0;
 int                 g_engineH = 0;
+
+// TheSuperHackers @port macOS: window size contract (HiDPI / resize / fullscreen).
+//   window content (points) x backingScaleFactor = drawable (pixels) = engine resolution.
+// The window is sized to engineRes / backingScale points, so the CAMetalLayer
+// presents 1:1 instead of upscaling a point-sized frame. A settled window size
+// change (user resize, fullscreen enter/exit, move to a display with another
+// backing scale) is posted as a resize request in pixels. The engine applies it
+// at a safe point in its frame (Win32GameEngine::serviceWindowsOS).
+// GEN_HIDPI=0 restores the legacy behaviour: points == engine pixels, no
+// fullscreen at launch, and the engine resolution never follows the window.
+int                 g_hidpi = -1;            // -1 = not read yet
+bool                g_applyingWindowSize = false;  // window resize caused by the engine
+bool                g_fullscreenTransition = false;
+bool                g_resizePending = false;
+int                 g_resizeW = 0;
+int                 g_resizeH = 0;
+int                 g_resizeFullscreen = 0;
+
+inline bool HiDPIOn()
+{
+    if (g_hidpi < 0) {
+        const char* e = getenv("GEN_HIDPI");
+        g_hidpi = (e && e[0] == '0') ? 0 : 1;
+    }
+    return g_hidpi != 0;
+}
 } // namespace
 
 extern "C" void MetalInput_SetEngineSize(int w, int h)
@@ -671,6 +697,7 @@ struct FSParams {
 
 struct MetalContext {
     NSWindow*            window;
+    NSObject*            windowDelegate;  // MetalWindowDelegate (owned; NSWindow does not retain it)
     MetalView*           view;
     CAMetalLayer*        layer;
     id<MTLDevice>        device;
@@ -828,7 +855,7 @@ struct MetalContext {
     // Private-texture staged uploads (see StageUpload): each entry owns a CF
     // ref on the texture and a pooled staging buffer; flushed into one blit
     // command buffer per Present (or inline every 64 during load bursts).
-    struct PendingUpload { void* tex; void* buf; int w, h, rowBytes; };
+    struct PendingUpload { void* tex; void* buf; int w, h, rowBytes, level; };
     std::vector<PendingUpload> pendingUploads;   // guarded by poolMutex (loader thread pushes)
     // Per-texture upload history for the churn throttle (see StageUpload):
     // tex -> (last upload frame, consecutive-frame streak). poolMutex-guarded.
@@ -1783,7 +1810,136 @@ static inline void DiagTexFree(void* tp) {
     c->texLiveBytes.fetch_sub((long)TexApproxBytes((__bridge id<MTLTexture>)tp), std::memory_order_relaxed);
 }
 
-extern "C" MetalContext* MetalContext_Create(int width, int height, int /*windowed*/)
+// ---------------------------------------------------------------------------
+// Window size contract helpers (see g_hidpi above).
+// ---------------------------------------------------------------------------
+static CGFloat WindowBackingScale(NSWindow* window, NSScreen* screen)
+{
+    if (!HiDPIOn()) return 1.0;
+    CGFloat s = window ? window.backingScaleFactor
+                       : (screen ? screen.backingScaleFactor : 1.0);
+    return (s > 0.0) ? s : 1.0;
+}
+
+// Content size in points that shows an engineW x engineH frame 1:1 at the given
+// backing scale. The result is clamped to the screen's visible frame with the
+// aspect ratio kept, so Cocoa grants the size that was asked for.
+static NSSize FitWindowPoints(int engineW, int engineH, NSScreen* screen, CGFloat scale)
+{
+    NSRect visible = screen ? screen.visibleFrame
+                            : NSMakeRect(0, 0, (CGFloat)engineW, (CGFloat)engineH);
+    // Leave a small margin so the titlebar and screen edges stay clear.
+    CGFloat maxW = visible.size.width  - 32.0;
+    CGFloat maxH = visible.size.height - 64.0;   // leave room for titlebar
+    if (maxW < 320.0) maxW = visible.size.width;
+    if (maxH < 240.0) maxH = visible.size.height;
+    CGFloat winW = (CGFloat)engineW / scale;
+    CGFloat winH = (CGFloat)engineH / scale;
+    if (winW > maxW || winH > maxH) {
+        double sx = (double)maxW / (double)winW;
+        double sy = (double)maxH / (double)winH;
+        double s  = (sx < sy) ? sx : sy;
+        winW = (CGFloat)((double)winW * s);
+        winH = (CGFloat)((double)winH * s);
+    }
+    return NSMakeSize(floor(winW), floor(winH));
+}
+
+// Pixel size of the window's content area, rounded down to even numbers like
+// every other resolution the engine uses.
+static bool WindowContentPixels(NSWindow* window, int* outW, int* outH)
+{
+    NSView* content = window.contentView;
+    if (!content) return false;
+    const CGFloat scale = WindowBackingScale(window, nil);
+    int w = (int)floor(content.bounds.size.width  * scale) & ~1;
+    int h = (int)floor(content.bounds.size.height * scale) & ~1;
+    if (w < 320 || h < 240) return false;
+    *outW = w;
+    *outH = h;
+    return true;
+}
+
+static void PostWindowResizeRequest(NSWindow* window, const char* why)
+{
+    if (!HiDPIOn() || g_applyingWindowSize || g_fullscreenTransition) return;
+    int w = 0, h = 0;
+    if (!WindowContentPixels(window, &w, &h)) return;
+    const int fs = (window.styleMask & NSWindowStyleMaskFullScreen) ? 1 : 0;
+    g_resizePending    = true;
+    g_resizeW          = w;
+    g_resizeH          = h;
+    g_resizeFullscreen = fs;
+    fprintf(stderr, "[metal] window %s: request %dx%dpx fullscreen=%d (scale %.2f)\n",
+            why, w, h, fs, (double)WindowBackingScale(window, nil));
+}
+
+// Follows the window: the engine resolution tracks the settled content size.
+// Intermediate sizes during a live resize or a fullscreen animation are not
+// posted; the AspectFitView letterboxes the old frame until the size settles.
+@interface MetalWindowDelegate : NSObject <NSWindowDelegate>
+@property (nonatomic, assign) CAMetalLayer* layer;   // unretained; ARC is off
+@end
+@implementation MetalWindowDelegate
+- (void)windowDidResize:(NSNotification*)n {
+    NSWindow* w = (NSWindow*)n.object;
+    if (w.inLiveResize) return;
+    PostWindowResizeRequest(w, "resize");
+}
+- (void)windowDidEndLiveResize:(NSNotification*)n {
+    PostWindowResizeRequest((NSWindow*)n.object, "live-resize");
+}
+- (void)windowWillEnterFullScreen:(NSNotification*)n { (void)n; g_fullscreenTransition = true; }
+- (void)windowWillExitFullScreen:(NSNotification*)n  { (void)n; g_fullscreenTransition = true; }
+- (void)windowDidEnterFullScreen:(NSNotification*)n {
+    g_fullscreenTransition = false;
+    PostWindowResizeRequest((NSWindow*)n.object, "enter-fullscreen");
+}
+// Cocoa posts this after it has restored the windowed frame, so the content
+// size read here is the settled one.
+- (void)windowDidExitFullScreen:(NSNotification*)n {
+    g_fullscreenTransition = false;
+    PostWindowResizeRequest((NSWindow*)n.object, "exit-fullscreen");
+}
+- (void)windowDidFailToEnterFullScreen:(NSWindow*)w { (void)w; g_fullscreenTransition = false; }
+- (void)windowDidFailToExitFullScreen:(NSWindow*)w  { (void)w; g_fullscreenTransition = false; }
+// Moving to a display with another backing scale keeps the point size and
+// changes the pixel size.
+- (void)windowDidChangeBackingProperties:(NSNotification*)n {
+    NSWindow* w = (NSWindow*)n.object;
+    if (self.layer) self.layer.contentsScale = WindowBackingScale(w, nil);
+    PostWindowResizeRequest(w, "backing-change");
+}
+@end
+
+extern "C" int MetalWindow_TakeResizeRequest(int* width, int* height, int* fullscreen)
+{
+    if (!g_resizePending) return 0;
+    g_resizePending = false;
+    if (width)      *width      = g_resizeW;
+    if (height)     *height     = g_resizeH;
+    if (fullscreen) *fullscreen = g_resizeFullscreen;
+    return 1;
+}
+
+extern "C" int MetalDisplay_GetNativePixelSize(int* width, int* height)
+{
+    if (!HiDPIOn()) return 0;
+    @autoreleasepool {
+        EnsureAppInitialized();
+        NSScreen* screen = [NSScreen mainScreen];
+        if (!screen) return 0;
+        const CGFloat scale = WindowBackingScale(nil, screen);
+        const int w = (int)lround(screen.frame.size.width  * scale) & ~1;
+        const int h = (int)lround(screen.frame.size.height * scale) & ~1;
+        if (w <= 0 || h <= 0) return 0;
+        if (width)  *width  = w;
+        if (height) *height = h;
+        return 1;
+    }
+}
+
+extern "C" MetalContext* MetalContext_Create(int width, int height, int windowed)
 {
     @autoreleasepool {
         EnsureAppInitialized();
@@ -1885,23 +2041,14 @@ extern "C" MetalContext* MetalContext_Create(int width, int height, int /*window
         // engine-pixel resolution via drawableSize. EventPoint linearly remaps
         // mouse coords from view-points to engine-pixels so the cursor stays
         // pixel-accurate regardless of how Cocoa actually sized the window.
+        // TheSuperHackers @port macOS @bugfix: the content size is the engine
+        // size divided by the backing scale, so a 2x display shows the frame 1:1
+        // instead of upscaling it 2x (GEN_HIDPI=0 keeps points == pixels).
         NSScreen* screen = [NSScreen mainScreen];
-        NSRect visible = screen ? screen.visibleFrame
-                                : NSMakeRect(0, 0, (CGFloat)width, (CGFloat)height);
-        // Leave a small margin so the titlebar and screen edges stay clear.
-        CGFloat maxW = visible.size.width  - 32.0;
-        CGFloat maxH = visible.size.height - 64.0;   // leave room for titlebar
-        if (maxW < 320.0) maxW = visible.size.width;
-        if (maxH < 240.0) maxH = visible.size.height;
-        CGFloat winW = (CGFloat)width;
-        CGFloat winH = (CGFloat)height;
-        if (winW > maxW || winH > maxH) {
-            double sx = (double)maxW / (double)winW;
-            double sy = (double)maxH / (double)winH;
-            double s  = (sx < sy) ? sx : sy;
-            winW = (CGFloat)((double)winW * s);
-            winH = (CGFloat)((double)winH * s);
-        }
+        const CGFloat backingScale = WindowBackingScale(nil, screen);
+        const NSSize winSize = FitWindowPoints(width, height, screen, backingScale);
+        const CGFloat winW = winSize.width;
+        const CGFloat winH = winSize.height;
         NSRect frame = NSMakeRect(0, 0, winW, winH);
         NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                   NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -1926,6 +2073,7 @@ extern "C" MetalContext* MetalContext_Create(int width, int height, int /*window
         // for offscreen PNG captures (debug only; YES is the fast default).
         layer.framebufferOnly = getenv("MTL_DUMP") ? NO : YES;
         layer.drawableSize    = CGSizeMake(width, height);
+        layer.contentsScale   = backingScale;
 
         // Host the MetalView inside an aspect-fit container so fullscreen keeps
         // the game's aspect ratio (letterbox) instead of stretching. In windowed
@@ -1947,6 +2095,14 @@ extern "C" MetalContext* MetalContext_Create(int width, int height, int /*window
         }
         [window makeFirstResponder:view];
         [window setAcceptsMouseMovedEvents:YES];
+        if (HiDPIOn()) {
+            [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+            // The window does not retain its delegate; the context owns it.
+            MetalWindowDelegate* delegate = [[MetalWindowDelegate alloc] init];
+            delegate.layer = layer;
+            [window setDelegate:delegate];
+            ctx->windowDelegate = delegate;
+        }
         [window makeKeyAndOrderFront:nil];
 
         ctx->window = window;
@@ -1958,8 +2114,15 @@ extern "C" MetalContext* MetalContext_Create(int width, int height, int /*window
         g_engineW = width;
         g_engineH = height;
         fprintf(stderr,
-                "[metal] window: engine=%dx%dpx, content=%.0fx%.0fpt, drawable=%dx%dpx\n",
-                width, height, (double)winW, (double)winH, width, height);
+                "[metal] window: engine=%dx%dpx, content=%.0fx%.0fpt, drawable=%dx%dpx, scale=%.2f, windowed=%d\n",
+                width, height, (double)winW, (double)winH, width, height,
+                (double)backingScale, windowed);
+
+        // TheSuperHackers @port macOS @feature: a fullscreen launch (no -win)
+        // enters a native fullscreen Space. The engine then follows the
+        // settled fullscreen size through the resize request.
+        if (!windowed && HiDPIOn())
+            [window toggleFullScreen:nil];
 
         BuildShadersAndStaticState(ctx);
 
@@ -1995,6 +2158,8 @@ extern "C" void MetalContext_Destroy(MetalContext* ctx)
         ctx->texFree.clear();
         for (size_t i = 0; i < ctx->texRetired.size(); ++i) CFRelease(ctx->texRetired[i].first);
         ctx->texRetired.clear();
+        [ctx->window setDelegate:nil];
+        if (ctx->windowDelegate) { [ctx->windowDelegate release]; ctx->windowDelegate = nil; }
         [ctx->window close];
         ctx->window = nil;
         ctx->view   = nil;
@@ -2161,6 +2326,33 @@ extern "C" void MetalContext_Resize(MetalContext* ctx, int width, int height)
         // runtime (Options → Display → Apply).
         g_engineW = width;
         g_engineH = height;
+
+        // TheSuperHackers @port macOS @bugfix: a resolution pick in a window
+        // resizes the window to show the new resolution 1:1. A reset that
+        // follows the window (resize request) already matches the window and
+        // leaves it alone; so does fullscreen, where the letterbox fits the frame.
+        NSWindow* window = ctx->window;
+        if (HiDPIOn() && window && !g_fullscreenTransition &&
+            !(window.styleMask & NSWindowStyleMaskFullScreen)) {
+            int curW = 0, curH = 0;
+            const bool matches = WindowContentPixels(window, &curW, &curH) &&
+                                 abs(curW - width) <= 2 && abs(curH - height) <= 2;
+            if (!matches) {
+                NSScreen* screen = window.screen ? window.screen : [NSScreen mainScreen];
+                const NSSize pts = FitWindowPoints(width, height, screen,
+                                                   WindowBackingScale(window, nil));
+                // The resize notifications this posts are engine-caused: do not
+                // answer them with another resize request.
+                g_applyingWindowSize = true;
+                [window setContentSize:pts];
+                // Keep the title bar reachable after the size change.
+                [window setFrame:[window constrainFrameRect:window.frame toScreen:screen]
+                         display:YES];
+                g_applyingWindowSize = false;
+                fprintf(stderr, "[metal] window resized for %dx%dpx: content=%.0fx%.0fpt\n",
+                        width, height, (double)pts.width, (double)pts.height);
+            }
+        }
     }
 }
 
@@ -2845,9 +3037,11 @@ extern "C" void MetalContext_Present(MetalContext* ctx)
 // D3DTSS_MIPFILTER, so textures the engine wants unmipmapped (UI/text, which it
 // marks MIP_LEVELS_1 → MIPFILTER=NONE) still sample level 0 only.
 //
-// Compressed BC textures keep a single level: Metal cannot generate mips for
-// compressed formats, and the stub uploads only their level 0. Set
-// MTL_NO_MIPMAPS=1 to fully revert to the old single-level behavior (A/B).
+// Compressed BC textures cannot be GPU-generated (Metal has no mip generation
+// for compressed formats). Instead they get the level count the engine asked
+// for in CreateTexture, and the stub uploads each level the DDS loader copies
+// in (MetalContext_UploadTextureRawLevel). Set MTL_NO_MIPMAPS=1 to fully
+// revert to the old single-level behavior (A/B).
 static bool MipmapsEnabled()
 {
     static int e = -1;
@@ -2865,6 +3059,12 @@ static NSUInteger MipCountFor(int width, int height)
     return levels;
 }
 
+static inline bool IsBCFormat(MTLPixelFormat pf)
+{
+    return pf == MTLPixelFormatBC1_RGBA || pf == MTLPixelFormatBC2_RGBA ||
+           pf == MTLPixelFormatBC3_RGBA;
+}
+
 // Queue a texture (whose level 0 was just uploaded) for mip-chain regeneration.
 // No-op for single-level textures (compressed / 1x1 / MTL_NO_MIPMAPS) and when
 // no context is available. Self-gates on mip level count. The actual GPU work is
@@ -2874,7 +3074,7 @@ static NSUInteger MipCountFor(int width, int height)
 // which saturated the IOGPU submission queue and wedged the main thread.
 static void GenerateMips(id<MTLTexture> tex)
 {
-    if (!tex || tex.mipmapLevelCount <= 1) return;
+    if (!tex || tex.mipmapLevelCount <= 1 || IsBCFormat(tex.pixelFormat)) return;
     MetalContext* ctx = s_uploadCtx;
     if (!ctx) return;
     if (!ctx->pendingMips) ctx->pendingMips = [[NSMutableSet alloc] init];
@@ -2940,6 +3140,12 @@ static void FlushPendingMips(MetalContext* ctx)
 
 extern "C" void* MetalContext_CreateTextureFmt(MetalContext* ctx, int width, int height, int bcKind)
 {
+    return MetalContext_CreateTextureLevels(ctx, width, height, bcKind, 1);
+}
+
+extern "C" void* MetalContext_CreateTextureLevels(MetalContext* ctx, int width, int height,
+                                                  int bcKind, int bcLevels)
+{
     if (!ctx) return nullptr;
     @autoreleasepool {
         MTLPixelFormat pf = MTLPixelFormatBGRA8Unorm;
@@ -2961,6 +3167,12 @@ extern "C" void* MetalContext_CreateTextureFmt(MetalContext* ctx, int width, int
         // request has real data to sample (see file-scope note above).
         if (!compressed && MipmapsEnabled())
             desc.mipmapLevelCount = MipCountFor(w, h);
+        // BC: the caller uploads every level itself, so allocate exactly the
+        // levels it asked for (capped at the full chain).
+        if (compressed && MipmapsEnabled() && bcLevels > 1) {
+            const NSUInteger full = MipCountFor(w, h);
+            desc.mipmapLevelCount = (NSUInteger)bcLevels < full ? (NSUInteger)bcLevels : full;
+        }
         desc.usage = MTLTextureUsageShaderRead;
         if (PrivateTexEnabled()) desc.storageMode = MTLStorageModePrivate;
         // Create/release recycling pool: reuse a same-descriptor texture retired
@@ -3028,9 +3240,10 @@ static void FlushPendingUploads(MetalContext* ctx)
                       sourceSize:MTLSizeMake((NSUInteger)u.w, (NSUInteger)u.h, 1)
                        toTexture:t
                 destinationSlice:0
-                destinationLevel:0
+                destinationLevel:(NSUInteger)u.level
                destinationOrigin:MTLOriginMake(0, 0, 0)];
-            if (t.mipmapLevelCount > 1) [blit generateMipmapsForTexture:t];
+            if (u.level == 0 && t.mipmapLevelCount > 1 && !IsBCFormat(t.pixelFormat))
+                [blit generateMipmapsForTexture:t];
         }
         [blit endEncoding];
         MetalContext* c = ctx;
@@ -3052,7 +3265,7 @@ static void FlushPendingUploads(MetalContext* ctx)
 // Queue one texture upload through a pooled staging buffer (Private-texture
 // path). `h` is in PIXELS; for BC formats the buffer holds (h+3)/4 block rows
 // of `rowBytes` each. Takes a CF retain on the texture until the blit commits.
-static void StageUpload(void* texture, const void* bytes, int w, int h, int rowBytes)
+static void StageUpload(void* texture, const void* bytes, int w, int h, int rowBytes, int level)
 {
     MetalContext* ctx = s_uploadCtx;
     if (!ctx) return;
@@ -3070,7 +3283,7 @@ static void StageUpload(void* texture, const void* bytes, int w, int h, int rowB
     size_t queued;
     {
         std::lock_guard<std::mutex> lk(ctx->poolMutex);
-        ctx->pendingUploads.push_back(MetalContext::PendingUpload{ texture, sbuf, w, h, rowBytes });
+        ctx->pendingUploads.push_back(MetalContext::PendingUpload{ texture, sbuf, w, h, rowBytes, level });
         queued = ctx->pendingUploads.size();
     }
     // Load bursts upload hundreds of textures between Presents — flush in
@@ -3081,7 +3294,19 @@ static void StageUpload(void* texture, const void* bytes, int w, int h, int rowB
 extern "C" void MetalContext_UploadTextureRaw(void* texture, int width, int height,
                                               const void* bytes, int bytesPerRow)
 {
-    if (!texture || !bytes || width <= 0 || height <= 0) return;
+    MetalContext_UploadTextureRawLevel(texture, 0, width, height, bytes, bytesPerRow);
+}
+
+extern "C" int MetalContext_TextureMipCount(void* texture)
+{
+    if (!texture) return 0;
+    return (int)((__bridge id<MTLTexture>)texture).mipmapLevelCount;
+}
+
+extern "C" void MetalContext_UploadTextureRawLevel(void* texture, int level, int width, int height,
+                                                   const void* bytes, int bytesPerRow)
+{
+    if (!texture || !bytes || width <= 0 || height <= 0 || level < 0) return;
     // MTL_UPLOAD_SKIP=N (diagnostic): drop N of every N+1 uploads — if the
     // menu deviceAlloc slope scales down proportionally, the driver allocates
     // per-replaceRegion service memory it never returns.
@@ -3092,15 +3317,22 @@ extern "C" void MetalContext_UploadTextureRaw(void* texture, int width, int heig
     }
     @autoreleasepool {
         id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
+        if ((NSUInteger)level >= tex.mipmapLevelCount) return;
+        // Clamp the region to the level's real size (BC regions may stop at
+        // the level edge, which need not be a multiple of 4).
+        const NSUInteger lw = MAX((NSUInteger)1, tex.width  >> level);
+        const NSUInteger lh = MAX((NSUInteger)1, tex.height >> level);
+        if ((NSUInteger)width  > lw) width  = (int)lw;
+        if ((NSUInteger)height > lh) height = (int)lh;
         if (tex.storageMode == MTLStorageModePrivate) {
-            StageUpload(texture, bytes, width, height, bytesPerRow);
+            StageUpload(texture, bytes, width, height, bytesPerRow, level);
             return;   // mips regenerate in the upload blit (FlushPendingUploads)
         }
         [tex replaceRegion:MTLRegionMake2D(0, 0, width, height)
-               mipmapLevel:0
+               mipmapLevel:(NSUInteger)level
                  withBytes:bytes
                bytesPerRow:(NSUInteger)bytesPerRow];
-        GenerateMips(tex);   // no-op unless tex was allocated with a mip chain
+        if (level == 0) GenerateMips(tex);   // no-op for BC / single-level textures
     }
 }
 
@@ -3292,7 +3524,7 @@ extern "C" void MetalContext_UploadTextureBGRA8(void* texture, int width, int he
     @autoreleasepool {
         id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
         if (tex.storageMode == MTLStorageModePrivate) {
-            StageUpload(texture, bgra8, width, height, bytesPerRow);
+            StageUpload(texture, bgra8, width, height, bytesPerRow, 0);
             return;   // mips regenerate in the upload blit (FlushPendingUploads)
         }
         [tex replaceRegion:MTLRegionMake2D(0, 0, width, height)
@@ -3675,11 +3907,14 @@ extern "C" int MetalCursor_WarpClient(int clientX, int clientY)
 {
     if (!g_inputView || !g_inputView.window) return 0;
     @autoreleasepool {
-        // 1) client pixels (top-left origin) -> view-local points (bottom-left origin).
-        //    On the active path drawableSize == bounds.size (no Retina up-scale),
-        //    so client pixels and view points are 1:1.
+        // 1) client (engine) pixels (top-left origin) -> view-local points
+        //    (bottom-left origin). Inverse of EventPoint: the view can be
+        //    smaller than the engine resolution (HiDPI, screen-fit clamp).
+        CGFloat w = g_inputView.bounds.size.width;
         CGFloat h = g_inputView.bounds.size.height;
-        NSPoint viewPt = NSMakePoint((CGFloat)clientX, h - (CGFloat)clientY);
+        double sx = (g_engineW > 0 && w > 0.0) ? (double)w / (double)g_engineW : 1.0;
+        double sy = (g_engineH > 0 && h > 0.0) ? (double)h / (double)g_engineH : 1.0;
+        NSPoint viewPt = NSMakePoint((CGFloat)(clientX * sx), h - (CGFloat)(clientY * sy));
         // 2) view-local -> window-base (identity if view is the contentView).
         NSPoint winPt = [g_inputView convertPoint:viewPt toView:nil];
         // 3) window-base -> screen (NSWindow API; macOS 10.7+).

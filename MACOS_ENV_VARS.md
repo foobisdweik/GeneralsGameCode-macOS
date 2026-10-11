@@ -149,6 +149,7 @@ diagnostic — leave unset for normal play.
 | `MTL_NO_COMBINER=1` | off | Skip the multi-stage texture combiner emulation. |
 | `MTL_SKIP3D=1` | off | Skip all 3D draws (keep only 2D/UI). |
 | `MTL_WATER_NOPASS2=1` | off | Skip the second water pass. |
+| `GEN_HIDPI=0` | on | Turn off the Retina window contract. When on, the window is sized to resolution ÷ backing scale (1:1 on Retina), a launch without `-win` enters native fullscreen, and the engine resolution follows the settled window size after a resize, a fullscreen enter/exit, or a move to a display with another backing scale. `0` restores the legacy behaviour: window points = engine pixels, no fullscreen at launch, and the resolution never follows the window. |
 
 ### 7b. Debug / verbose / capture
 

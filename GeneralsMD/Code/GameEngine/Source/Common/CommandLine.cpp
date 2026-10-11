@@ -1171,6 +1171,13 @@ static CommandLineParam paramsForEngineInit[] =
 	{ "-noShellAnim", parseNoWindowAnimation }, // TheSuperHackers @tweak Is now available in Release builds.
 	{ "-xres", parseXRes },
 	{ "-yres", parseYRes },
+#if defined(__APPLE__)
+	// TheSuperHackers @port macOS @bugfix: retail GameData.ini sets "Windowed = No", which
+	// overwrites the startup value of -win before the Metal window is created. Parse the
+	// window mode again after the INI so that -win and -fullscreen take effect.
+	{ "-win", parseWin },
+	{ "-fullscreen", parseNoWin },
+#endif
 	{ "-fullVersion", parseFullVersion },
 	{ "-particleEdit", parseParticleEdit },
 	{ "-scriptDebug", parseScriptDebug },

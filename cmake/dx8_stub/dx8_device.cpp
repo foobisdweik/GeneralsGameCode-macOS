@@ -145,32 +145,46 @@ inline void ConvertRowToBGRA8(D3DFORMAT fmt, const unsigned char* src, unsigned 
 }
 
 // ---------------------------------------------------------------------------
-// IDirect3DTexture8  (single-level RGBA texture wrapping an MTLTexture)
+// IDirect3DTexture8  (RGBA or BC texture wrapping an MTLTexture)
+//
+// Uncompressed textures expose one level; the backend GPU-generates their mip
+// chain from level 0. BC textures expose the level count the engine requested
+// (the DDS loader copies every file level in), because Metal cannot generate
+// mips for compressed formats. Levels == 0 (MIP_LEVELS_ALL) stays single-level
+// for BC: only the surface-copy path asks for it, and it fills level 0 only.
 // ---------------------------------------------------------------------------
 class MetalTexture8 : public IDirect3DTexture8 {
 public:
-    MetalTexture8(IDirect3DDevice8* dev, MetalContext* ctx, UINT w, UINT h, D3DFORMAT fmt)
-        : m_refCount(1), m_device(dev), m_width(w), m_height(h), m_format(fmt)
+    MetalTexture8(IDirect3DDevice8* dev, MetalContext* ctx, UINT w, UINT h, D3DFORMAT fmt, UINT levels)
+        : m_refCount(1), m_device(dev), m_ctx(ctx), m_width(w), m_height(h), m_format(fmt)
     {
         m_compressed = IsCompressedFmt(fmt);
         if (m_compressed) {
             // Native BC texture; CPU staging holds tightly-packed compressed
             // blocks (the engine memcpy's the DDS level straight in).
-            m_texture = MetalContext_CreateTextureFmt(ctx, (int)w, (int)h, BcKind(fmt));
-            size_t sz = 0;
-            BcLayout(fmt, w ? w : 1, h ? h : 1, m_pitch, sz);
-            m_staging.resize(sz, 0);
+            m_texture = MetalContext_CreateTextureLevels(ctx, (int)w, (int)h, BcKind(fmt),
+                                                         levels > 1 ? (int)levels : 1);
+            const int got = MetalContext_TextureMipCount(m_texture);
+            m_levels = got > 1 ? (UINT)got : 1;
+            UINT pitch = 0;
+            BcLayout(fmt, w ? w : 1, h ? h : 1, pitch, m_dataSize);
         } else {
             m_texture = MetalContext_CreateTexture(ctx, (int)w, (int)h);
-            m_bpp     = FormatBpp(fmt);
-            m_pitch   = (w ? w : 1) * m_bpp;
-            // CPU staging in the source format; converted to BGRA8 on UnlockRect.
-            m_staging.resize((size_t)m_pitch * (h ? h : 1), 0);
+            m_dataSize = (size_t)(w ? w : 1) * FormatBpp(fmt) * (h ? h : 1);
         }
+        // The CPU mirror of level 0 lives in the cached level-0 surface (see
+        // level0()), shared by LockRect and GetSurfaceLevel.
     }
     ~MetalTexture8();  // out-of-line below: unbinds the cached level-0 surface first
 
-    void* dxTexture() const { return m_texture; } // opaque MTLTexture*
+    // Opaque MTLTexture* for binding. A BC texture whose sub-levels were not
+    // all uploaded would sample garbage at distance, so it falls back to a
+    // single-level copy of level 0 first (see demoteToLevel0).
+    void* dxTexture()
+    {
+        if (m_levels > 1 && m_uploadedMask != fullLevelMask()) demoteToLevel0();
+        return m_texture;
+    }
 
     // Returns the MTLTexture the next upload must write into. The FIRST upload
     // fills the texture before any draw referenced it, so in-place replaceRegion
@@ -179,7 +193,7 @@ public:
     // frames still sampling the old contents (black/torn texture flicker).
     // Defined out-of-line below — rebinds the cached level-0 surface, which
     // needs the full MetalSurface8 definition.
-    void* prepareUploadBacking();
+    void* prepareUploadBacking(UINT level);
 
     // IUnknown
     STDMETHOD(QueryInterface)(REFIID, void** ppvObj) override { return BasicQueryInterface(this, ppvObj); }
@@ -199,10 +213,10 @@ public:
     // IDirect3DBaseTexture8
     STDMETHOD_(DWORD, SetLOD)(DWORD) override { return 0; }
     STDMETHOD_(DWORD, GetLOD)() override { return 0; }
-    STDMETHOD_(DWORD, GetLevelCount)() override { return 1; }
+    STDMETHOD_(DWORD, GetLevelCount)() override { return m_levels; }
 
     // IDirect3DTexture8
-    STDMETHOD(GetLevelDesc)(UINT, D3DSURFACE_DESC* pDesc) override
+    STDMETHOD(GetLevelDesc)(UINT Level, D3DSURFACE_DESC* pDesc) override
     {
         if (pDesc) {
             std::memset(pDesc, 0, sizeof(*pDesc));
@@ -211,72 +225,57 @@ public:
             pDesc->Pool   = D3DPOOL_MANAGED;
             pDesc->Width  = m_width;
             pDesc->Height = m_height;
-            pDesc->Size   = (UINT)m_staging.size();
+            pDesc->Size   = (UINT)m_dataSize;
+            if (Level > 0 && Level < m_levels) {
+                pDesc->Width  = levelWidth(Level);
+                pDesc->Height = levelHeight(Level);
+                UINT pitch = 0; size_t size = 0;
+                BcLayout(m_format, pDesc->Width, pDesc->Height, pitch, size);
+                pDesc->Size = (UINT)size;
+            }
         }
         return S_OK;
     }
     // Defined out-of-line below (needs the full MetalSurface8 definition).
     STDMETHOD(GetSurfaceLevel)(UINT Level, IDirect3DSurface8** ppSurfaceLevel) override;
-    STDMETHOD(LockRect)(UINT, D3DLOCKED_RECT* pLockedRect, CONST RECT*, DWORD) override
-    {
-        if (pLockedRect) {
-            pLockedRect->Pitch = (INT)m_pitch;
-            pLockedRect->pBits = m_staging.data();
-        }
-        return S_OK;
-    }
-    STDMETHOD(UnlockRect)(UINT) override
-    {
-        // Convert the locked source-format bytes to BGRA8 and push to the GPU.
-        if (!m_texture || m_staging.empty()) return S_OK;
-        void* dst = prepareUploadBacking();
-        if (!dst) return S_OK;
-        if (m_compressed) {
-            // Upload the BC blocks verbatim (no conversion).
-            MetalContext_UploadTextureRaw(dst, (int)(m_width ? m_width : 1),
-                                          (int)(m_height ? m_height : 1),
-                                          m_staging.data(), (int)m_pitch);
-            return S_OK;
-        }
-        const UINT w = m_width ? m_width : 1;
-        const UINT h = m_height ? m_height : 1;
-        std::vector<unsigned char> bgra((size_t)w * h * 4);
-        for (UINT y = 0; y < h; ++y) {
-            ConvertRowToBGRA8(m_format, m_staging.data() + (size_t)y * m_pitch,
-                              bgra.data() + (size_t)y * w * 4, w);
-        }
-        {
-            const unsigned char* cc = bgra.data() + ((size_t)(h/2) * w + (w/2)) * 4;
-            m_isMissing = (cc[0]==255 && cc[1]==0 && cc[2]==255);
-        }
-        static int dbg = -1; if (dbg < 0) dbg = getenv("MTL_DEBUG") ? 1 : 0;
-        if (dbg) {
-            static int n = 0;
-            if (n++ < 24) {
-                const unsigned char* c = bgra.data() + ((size_t)(h/2) * w + (w/2)) * 4;
-                std::fprintf(stderr, "[tex] #%d this=%p fmt=%u %ux%u center BGRA=%u,%u,%u,%u%s\n",
-                             n, (void*)this, (unsigned)m_format, w, h, c[0], c[1], c[2], c[3],
-                             m_isMissing ? "  <-- MISSING" : "");
-            }
-        }
-        MetalContext_UploadTextureBGRA8(dst, (int)w, (int)h, bgra.data(), (int)(w * 4));
-        return S_OK;
-    }
+    // LockRect/UnlockRect go through the cached level-0 surface, so the
+    // texture has ONE CPU mirror. With a separate mirror here, the loader's
+    // LockRect writes were invisible to GetSurfaceLevel(0) readers: house-color
+    // recolor (W3DAssetManager::Recolor_Texture_One_Time) copied an all-zero
+    // surface, and every ZHCA_* infantry texture rendered black.
+    // Defined out-of-line below (need the full MetalSurface8 definition).
+    STDMETHOD(LockRect)(UINT Level, D3DLOCKED_RECT* pLockedRect, CONST RECT* pRect, DWORD Flags) override;
+    STDMETHOD(UnlockRect)(UINT Level) override;
     bool isMissingTex() const { return m_isMissing; }
     STDMETHOD(AddDirtyRect)(CONST RECT*) override { return S_OK; }
 
 private:
     ULONG             m_refCount;
     IDirect3DDevice8* m_device;
+    MetalContext*     m_ctx;
     void*             m_texture;   // MTLTexture (CFRetained)
     UINT              m_width, m_height;
     D3DFORMAT         m_format;
-    UINT              m_bpp = 4;
-    UINT              m_pitch;
+    size_t            m_dataSize = 0;  // level-0 bytes in m_format (GetLevelDesc)
+    UINT              m_levels = 1;    // mip levels exposed to the engine (BC only > 1)
+    // Bit N set = level N uploaded into the current m_texture. Uploading a level
+    // whose bit is already set is a RE-upload and renames the backing texture.
+    uint32_t          m_uploadedMask = 0;
     bool              m_isMissing = false;
     bool              m_compressed = false;
-    bool              m_everUploaded = false;  // first upload = in-place; re-uploads rename
-    std::vector<unsigned char> m_staging;
+    UINT levelWidth(UINT level)  const { UINT v = m_width  >> level; return v ? v : 1; }
+    UINT levelHeight(UINT level) const { UINT v = m_height >> level; return v ? v : 1; }
+    uint32_t fullLevelMask() const { return m_levels >= 32 ? 0xFFFFFFFFu : ((1u << m_levels) - 1u); }
+    // Returns the cached level-0 surface, creating it on first use (no AddRef).
+    IDirect3DSurface8* level0();
+    // Returns the cached surface for BC mip level 1..m_levels-1 (no AddRef).
+    IDirect3DSurface8* levelSurface(UINT level);
+    // Drops the sub-levels and rebuilds a single-level texture from the level-0
+    // mirror. Used when a mipped BC texture is bound with levels missing.
+    void demoteToLevel0();
+    void releaseLevelSurfaces();
+    // Persistent CPU mirrors of BC mip levels 1..N (index 0 unused).
+    std::vector<IDirect3DSurface8*> m_levelSurfaces;
     // Persistent CPU mirror of mip level 0 (lazily created by GetSurfaceLevel).
     // Real D3D hands back the *same* surface memory each call; the engine relies
     // on that for partial / read-modify-write texture updates (see GetSurfaceLevel).
@@ -319,6 +318,10 @@ public:
         }
     }
     size_t surfDataSize() const { return m_staging_size; }
+    // Frees the BGRA upload scratch. MetalTexture8 calls this after a texture's
+    // first upload: most textures upload once, and the scratch would otherwise
+    // stay resident beside the staging mirror.
+    void releaseUploadScratch() { std::vector<unsigned char>().swap(m_bgraScratch); }
 
     // When this surface is a texture mip level (returned by
     // MetalTexture8::GetSurfaceLevel), it carries the owning MTLTexture so that
@@ -327,6 +330,8 @@ public:
     // ...and the owning MetalTexture8 wrapper, so flushToTexture can route the
     // upload through prepareUploadBacking (dynamic-texture rename on re-upload).
     void bindOwnerTexture(MetalTexture8* owner) { m_ownerTex = owner; }
+    // Mip level of the owning texture that this surface uploads into.
+    void bindUploadLevel(UINT level) { m_uploadLevel = level; }
 
     // Accessors used by MetalDevice8::CopyRects.
     UINT      surfWidth()  const { return m_width; }
@@ -346,13 +351,17 @@ public:
         if (!m_uploadTexture || m_staging.empty()) return;
         // Re-uploads must not replaceRegion in-place while in-flight GPU frames
         // still sample the texture — swap to a fresh pooled backing first.
-        if (m_ownerTex) m_uploadTexture = m_ownerTex->prepareUploadBacking();
+        if (m_ownerTex) m_uploadTexture = m_ownerTex->prepareUploadBacking(m_uploadLevel);
         if (!m_uploadTexture) return;
         if (m_compressed) {
             // Upload BC blocks verbatim (no conversion).
-            MetalContext_UploadTextureRaw(m_uploadTexture, (int)(m_width ? m_width : 1),
-                                          (int)(m_height ? m_height : 1),
-                                          m_staging.data(), (int)m_pitch);
+            MetalContext_UploadTextureRawLevel(m_uploadTexture, (int)m_uploadLevel,
+                                               (int)(m_width ? m_width : 1),
+                                               (int)(m_height ? m_height : 1),
+                                               m_staging.data(), (int)m_pitch);
+            // Sub-level mirrors are write-once (DDS load); free them so CPU
+            // memory holds only the level-0 mirror, as before mips existed.
+            if (m_uploadLevel > 0) std::vector<unsigned char>().swap(m_staging);
             return;
         }
         const UINT w = m_width ? m_width : 1;
@@ -438,6 +447,7 @@ private:
     bool              m_compressed = false;
     void*             m_uploadTexture = nullptr;  // MTLTexture if this is a texture level
     MetalTexture8*    m_ownerTex = nullptr;       // owning wrapper (rename routing); no ref held
+    UINT              m_uploadLevel = 0;          // owning texture's mip level
     size_t            m_staging_size = 0;         // logical bytes (set in ctor; alloc is lazy)
     std::vector<unsigned char> m_staging;
     // Persistent BGRA scratch used by flushToTexture() for the BGR0/ARGB→BGRA8
@@ -469,25 +479,119 @@ HRESULT STDMETHODCALLTYPE MetalTexture8::GetSurfaceLevel(UINT Level, IDirect3DSu
     // mirror intact between calls. (bindUploadTexture wires it to this texture's
     // MTLTexture so UnlockRect / CopyRects push pixels to the GPU.)
     if (Level == 0) {
-        if (!m_level0Surface) {
-            UINT w = m_width  ? m_width  : 1;
-            UINT h = m_height ? m_height : 1;
-            MetalSurface8* surf = new MetalSurface8(m_device, w, h, m_format);
-            surf->bindUploadTexture(m_texture);
-            surf->bindOwnerTexture(this);    // route re-uploads through the rename path
-            m_level0Surface = surf;          // texture keeps one reference
-        }
-        m_level0Surface->AddRef();           // reference for the returned pointer
-        *ppSurfaceLevel = m_level0Surface;
+        IDirect3DSurface8* surf = level0();
+        surf->AddRef();                      // reference for the returned pointer
+        *ppSurfaceLevel = surf;
         return D3D_OK;
     }
 
-    // Non-zero levels are never produced (GetLevelCount()==1) but keep a sane
-    // fallback: a transient, unbound surface.
+    // BC mip levels: cached like level 0, bound to upload into that level.
+    if (Level < m_levels) {
+        IDirect3DSurface8* surf = levelSurface(Level);
+        surf->AddRef();
+        *ppSurfaceLevel = surf;
+        return D3D_OK;
+    }
+
+    // Levels beyond GetLevelCount(): keep a sane fallback, a transient,
+    // unbound surface.
     UINT w = m_width  >> Level; if (!w) w = 1;
     UINT h = m_height >> Level; if (!h) h = 1;
     *ppSurfaceLevel = new MetalSurface8(m_device, w, h, m_format);
     return D3D_OK;
+}
+
+IDirect3DSurface8* MetalTexture8::level0()
+{
+    if (!m_level0Surface) {
+        UINT w = m_width  ? m_width  : 1;
+        UINT h = m_height ? m_height : 1;
+        MetalSurface8* surf = new MetalSurface8(m_device, w, h, m_format);
+        surf->bindUploadTexture(m_texture);
+        surf->bindOwnerTexture(this);        // route re-uploads through the rename path
+        m_level0Surface = surf;              // texture keeps one reference
+    }
+    return m_level0Surface;
+}
+
+IDirect3DSurface8* MetalTexture8::levelSurface(UINT level)
+{
+    if (m_levelSurfaces.size() < m_levels) m_levelSurfaces.resize(m_levels, nullptr);
+    if (!m_levelSurfaces[level]) {
+        MetalSurface8* surf = new MetalSurface8(m_device, levelWidth(level), levelHeight(level), m_format);
+        surf->bindUploadTexture(m_texture);
+        surf->bindOwnerTexture(this);
+        surf->bindUploadLevel(level);
+        m_levelSurfaces[level] = surf;       // texture keeps one reference
+    }
+    return m_levelSurfaces[level];
+}
+
+void MetalTexture8::releaseLevelSurfaces()
+{
+    for (IDirect3DSurface8* s : m_levelSurfaces) {
+        if (!s) continue;
+        MetalSurface8* surf = static_cast<MetalSurface8*>(s);
+        surf->bindOwnerTexture(nullptr);
+        surf->bindUploadTexture(nullptr);
+        s->Release();
+    }
+    m_levelSurfaces.clear();
+}
+
+void MetalTexture8::demoteToLevel0()
+{
+    // Without level 0 there is nothing better to show; leave it as is.
+    if (!(m_uploadedMask & 1u)) return;
+    const UINT w = m_width ? m_width : 1;
+    const UINT h = m_height ? m_height : 1;
+    void* single = MetalContext_CreateTextureLevels(m_ctx, (int)w, (int)h, BcKind(m_format), 1);
+    if (!single) return;
+    MetalSurface8* s0 = static_cast<MetalSurface8*>(level0());
+    MetalContext_UploadTextureRawLevel(single, 0, (int)w, (int)h, s0->surfBits(), (int)s0->surfPitch());
+    static int dbg = -1; if (dbg < 0) dbg = getenv("MTL_DEBUG") ? 1 : 0;
+    if (dbg) std::fprintf(stderr, "[tex] demote %ux%u fmt=%u levels=%u mask=0x%x -> 1 level\n",
+                          w, h, (unsigned)m_format, m_levels, m_uploadedMask);
+    MetalContext_ReleaseTexture(m_texture);
+    m_texture = single;
+    m_levels = 1;
+    m_uploadedMask = 1u;
+    s0->bindUploadTexture(single);
+    releaseLevelSurfaces();
+}
+
+HRESULT STDMETHODCALLTYPE MetalTexture8::LockRect(UINT Level, D3DLOCKED_RECT* pLockedRect, CONST RECT* pRect, DWORD Flags)
+{
+    if (Level > 0 && Level < m_levels) return levelSurface(Level)->LockRect(pLockedRect, pRect, Flags);
+    return level0()->LockRect(pLockedRect, pRect, Flags);
+}
+
+HRESULT STDMETHODCALLTYPE MetalTexture8::UnlockRect(UINT Level)
+{
+    if (Level > 0 && Level < m_levels) return levelSurface(Level)->UnlockRect();
+    // Converts the source-format bytes to BGRA8 (or uploads BC blocks verbatim)
+    // and pushes them to the GPU.
+    MetalSurface8* surf = static_cast<MetalSurface8*>(level0());
+    const bool firstUpload = !(m_uploadedMask & 1u);
+    surf->UnlockRect();
+    if (firstUpload) surf->releaseUploadScratch();
+    if (!m_compressed) {
+        const UINT w = m_width ? m_width : 1;
+        const UINT h = m_height ? m_height : 1;
+        unsigned char c[4];
+        ConvertRowToBGRA8(m_format, surf->surfBits() + (size_t)(h/2) * surf->surfPitch()
+                                    + (size_t)(w/2) * FormatBpp(m_format), c, 1);
+        m_isMissing = (c[0]==255 && c[1]==0 && c[2]==255);
+        static int dbg = -1; if (dbg < 0) dbg = getenv("MTL_DEBUG") ? 1 : 0;
+        if (dbg) {
+            static int n = 0;
+            if (n++ < 24)
+                std::fprintf(stderr, "[tex] #%d this=%p fmt=%u %ux%u center BGRA=%u,%u,%u,%u%s\n",
+                             n, (void*)this, (unsigned)m_format, w, h, c[0], c[1], c[2], c[3],
+                             m_isMissing ? "  <-- MISSING" : "");
+        }
+    }
+    return S_OK;
 }
 
 // MetalTexture8 destructor — out-of-line because it must unbind the cached
@@ -497,6 +601,7 @@ HRESULT STDMETHODCALLTYPE MetalTexture8::GetSurfaceLevel(UINT Level, IDirect3DSu
 // use-after-free on the wrapper / a replaceRegion on a released MTLTexture.
 MetalTexture8::~MetalTexture8()
 {
+    releaseLevelSurfaces();
     if (m_level0Surface) {
         MetalSurface8* surf = static_cast<MetalSurface8*>(m_level0Surface);
         surf->bindOwnerTexture(nullptr);
@@ -512,18 +617,27 @@ MetalTexture8::~MetalTexture8()
 // keeps serving the in-flight frames that already sampled/bound it (command
 // buffers retain their resources) and is recycled once the GPU finishes them.
 // Draws encoded after this point resolve the new pointer via dxTexture().
-void* MetalTexture8::prepareUploadBacking()
+//
+// Per mip level: the first upload of each level is in place (the DDS loader
+// fills levels 0..N back to back before the texture is bound). A rename gives
+// a texture whose other levels are undefined, so the mask restarts and
+// dxTexture() falls back to level 0 if they are not re-uploaded.
+void* MetalTexture8::prepareUploadBacking(UINT level)
 {
     if (!m_texture) return nullptr;
-    if (m_everUploaded) {
+    const uint32_t bit = level < 32 ? (1u << level) : 0u;
+    if (m_uploadedMask & bit) {
         void* fresh = MetalContext_RenameTexture(m_texture);
         if (fresh && fresh != m_texture) {
             m_texture = fresh;
             if (m_level0Surface)
                 static_cast<MetalSurface8*>(m_level0Surface)->bindUploadTexture(fresh);
+            for (IDirect3DSurface8* s : m_levelSurfaces)
+                if (s) static_cast<MetalSurface8*>(s)->bindUploadTexture(fresh);
+            m_uploadedMask = 0;
         }
     }
-    m_everUploaded = true;
+    m_uploadedMask |= bit;
     return m_texture;
 }
 
@@ -1020,9 +1134,9 @@ public:
     STDMETHOD_(void, GetGammaRamp)(D3DGAMMARAMP* pRamp) override { if (pRamp) *pRamp = m_gammaRamp; }
 
     // ---- resource creation ----
-    STDMETHOD(CreateTexture)(UINT Width, UINT Height, UINT, DWORD, D3DFORMAT Format, D3DPOOL, IDirect3DTexture8** ppTexture) override
+    STDMETHOD(CreateTexture)(UINT Width, UINT Height, UINT Levels, DWORD, D3DFORMAT Format, D3DPOOL, IDirect3DTexture8** ppTexture) override
     {
-        if (ppTexture) *ppTexture = new MetalTexture8(this, m_ctx, Width, Height, Format);
+        if (ppTexture) *ppTexture = new MetalTexture8(this, m_ctx, Width, Height, Format, Levels);
         return D3D_OK;
     }
     STDMETHOD(CreateVolumeTexture)(UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture8** pp) override
@@ -1764,7 +1878,7 @@ private:
     // Advertised display modes. The engine (DX8Wrapper::Find_Color_Mode) scans
     // these for an exact width/height/format match, so we expose the common
     // resolutions in both a 32-bit (X8R8G8B8) and a 16-bit (R5G6B5) format.
-    static const D3DDISPLAYMODE* ModeTable()
+    static const std::vector<D3DDISPLAYMODE>& ModeTable()
     {
         static const struct { UINT w, h; } kRes[] = {
             { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 },
@@ -1775,25 +1889,41 @@ private:
         static const D3DFORMAT kFmt[] = { D3DFMT_X8R8G8B8, D3DFMT_R5G6B5 };
         static const UINT kResCount = sizeof(kRes) / sizeof(kRes[0]);
         static const UINT kFmtCount = sizeof(kFmt) / sizeof(kFmt[0]);
-        static D3DDISPLAYMODE table[kResCount * kFmtCount];
-        static bool built = false;
-        if (!built) {
-            UINT idx = 0;
-            for (UINT f = 0; f < kFmtCount; ++f)
+        static std::vector<D3DDISPLAYMODE> table;
+        if (table.empty()) {
+            // TheSuperHackers @port macOS @feature: also offer the main display's
+            // native pixel size (e.g. 3456x2234 on a 16" MacBook Pro), so the
+            // resolution that a fullscreen window follows to stays selectable
+            // in Options.
+            UINT nativeW = 0, nativeH = 0;
+            int w = 0, h = 0;
+            if (MetalDisplay_GetNativePixelSize(&w, &h)) {
+                nativeW = (UINT)w;
+                nativeH = (UINT)h;
+                for (UINT r = 0; r < kResCount; ++r)
+                    if (kRes[r].w == nativeW && kRes[r].h == nativeH) nativeW = nativeH = 0;
+            }
+            for (UINT f = 0; f < kFmtCount; ++f) {
+                D3DDISPLAYMODE m;
+                m.RefreshRate = 60;
+                m.Format = kFmt[f];
                 for (UINT r = 0; r < kResCount; ++r) {
-                    table[idx].Width = kRes[r].w;
-                    table[idx].Height = kRes[r].h;
-                    table[idx].RefreshRate = 60;
-                    table[idx].Format = kFmt[f];
-                    ++idx;
+                    m.Width = kRes[r].w;
+                    m.Height = kRes[r].h;
+                    table.push_back(m);
                 }
-            built = true;
+                if (nativeW && nativeH) {
+                    m.Width = nativeW;
+                    m.Height = nativeH;
+                    table.push_back(m);
+                }
+            }
         }
         return table;
     }
     static UINT ModeCount()
     {
-        return 15u /*resolutions*/ * 2u /*formats*/;
+        return (UINT)ModeTable().size();
     }
     static void FillMode(D3DDISPLAYMODE* pMode)
     {

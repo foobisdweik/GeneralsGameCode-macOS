@@ -31,6 +31,9 @@
 #include <pthread.h>      // pthread_create (CreateThread)
 #include <limits.h>       // PATH_MAX
 #include <string>         // std::string (find-handle bookkeeping)
+#if defined(__APPLE__)
+#include <crt_externs.h>   // _NSGetArgc/_NSGetArgv (GetCommandLineA)
+#endif
 
 // COLORREF (0x00bbggrr) used by the GDI text stubs below.
 #ifndef _COLORREF_DEFINED
@@ -1831,9 +1834,33 @@ inline BOOL DeleteFile(const char *path)
 inline BOOL DeleteFileA(const char *path) { return DeleteFile(path); }
 
 // --- Command line. ---------------------------------------------------------
-// The real process command line is not reconstructed here; callers only need a
-// non-null string. TODO(macos): stash argv at startup if exact text is needed.
+// TheSuperHackers @port macOS @bugfix: rebuild the command line from the process
+// argv. The engine parses -win, -xres, -yres and the other flags from this
+// string, so an empty stub silently ignored all of them. Arguments that contain
+// a space are quoted, which the engine's tokenizer (nextParam with "\" ") expects.
+// Other non-Win32 platforms keep the empty string.
+#if defined(__APPLE__)
+inline char *GetCommandLineA()
+{
+	static std::string s_cmdLine;
+	static bool s_built = false;
+	if (!s_built) {
+		s_built = true;
+		char **argv = *_NSGetArgv();
+		const int argc = *_NSGetArgc();
+		for (int i = 0; i < argc; ++i) {
+			if (i > 0) s_cmdLine += ' ';
+			const bool quote = std::strchr(argv[i], ' ') != nullptr;
+			if (quote) s_cmdLine += '"';
+			s_cmdLine += argv[i];
+			if (quote) s_cmdLine += '"';
+		}
+	}
+	return &s_cmdLine[0];
+}
+#else
 inline char *GetCommandLineA() { static char s_empty[1] = {0}; return s_empty; }
+#endif
 inline char *GetCommandLine()  { return GetCommandLineA(); }
 
 // --- COM task allocator (SHGetKnownFolderPath partner). --------------------

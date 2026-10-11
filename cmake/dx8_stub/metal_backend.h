@@ -45,6 +45,18 @@ void MetalContext_Resize(MetalContext* ctx, int width, int height);
 // Pump pending NSEvents without presenting (used outside the draw loop).
 void MetalContext_PumpEvents(MetalContext* ctx);
 
+// Window size contract: window content (points) x backing scale = drawable
+// (pixels) = engine resolution. When the window settles at a new size (user
+// resize, fullscreen enter/exit, move to a display with another backing scale),
+// the backend posts a resize request in pixels. Returns 1 and fills the
+// out-params once per request, or 0 if nothing is pending. fullscreen is 1 when
+// the window is in a native fullscreen Space. Never posts when GEN_HIDPI=0.
+int MetalWindow_TakeResizeRequest(int* width, int* height, int* fullscreen);
+
+// Pixel size of the main display (points x backing scale). Returns 0 when
+// unknown or when GEN_HIDPI=0.
+int MetalDisplay_GetNativePixelSize(int* width, int* height);
+
 // Debug: write a BGRA8 image to /tmp/<name>.png (alpha as luminance). No-op
 // unless MTL_DUMP is set. Used to inspect intermediate surfaces.
 void  MetalDebug_DumpBGRA(const char* name, int width, int height, const void* bgra8, int bytesPerRow);
@@ -61,6 +73,16 @@ void  MetalContext_ReleaseTexture(void* texture);
 // compressed blocks (no CPU decode). width/height are in pixels.
 void* MetalContext_CreateTextureFmt(MetalContext* ctx, int width, int height, int bcKind);
 
+// As CreateTextureFmt, but a BC texture (bcKind 1..3) gets bcLevels mip levels
+// (capped at the full chain; 1 under MTL_NO_MIPMAPS). The caller uploads each
+// level with MetalContext_UploadTextureRawLevel. bcLevels is ignored for
+// uncompressed textures, which always get a GPU-generated full chain.
+void* MetalContext_CreateTextureLevels(MetalContext* ctx, int width, int height,
+                                       int bcKind, int bcLevels);
+
+// Number of mip levels the MTLTexture was allocated with.
+int   MetalContext_TextureMipCount(void* texture);
+
 // Upload a tightly/pitch-packed BGRA8 image into an MTLTexture (replaceRegion).
 void  MetalContext_UploadTextureBGRA8(void* texture, int width, int height,
                                       const void* bgra8, int bytesPerRow);
@@ -70,6 +92,12 @@ void  MetalContext_UploadTextureBGRA8(void* texture, int width, int height,
 // level (0,0,width,height) in pixels; Metal derives block counts from the format.
 void  MetalContext_UploadTextureRaw(void* texture, int width, int height,
                                     const void* bytes, int bytesPerRow);
+
+// As UploadTextureRaw, into mip level `level`. width/height are the level's
+// size in pixels (clamped to the real level size). Only level 0 triggers GPU
+// mip generation, and never for BC formats.
+void  MetalContext_UploadTextureRawLevel(void* texture, int level, int width, int height,
+                                         const void* bytes, int bytesPerRow);
 
 // Rename a dynamic texture before a RE-upload (D3D discard semantics).
 // replaceRegion on a texture a still-executing command buffer is sampling is a

@@ -474,6 +474,18 @@ void GameEngine::init()
 		CommandLine::parseCommandLineForEngineInit();
 
 #if defined(__APPLE__)
+		// macOS port: always skip the intro logos and intro movie, as if -nologo
+		// were passed. Set after GameData.ini, whose PlayIntro would override it.
+		TheWritableGlobalData->m_playIntro = FALSE;
+		TheWritableGlobalData->m_afterIntro = TRUE;
+		TheWritableGlobalData->m_playSizzle = FALSE;
+
+		// macOS port: allow the camera to zoom out 1.5x higher than GameData.ini's
+		// MaxCameraHeight.
+		TheWritableGlobalData->m_maxCameraHeight *= 1.5f;
+#endif
+
+#if defined(__APPLE__)
 		// macOS port: the C runtime main() passes an empty command line to the
 		// engine (argv is intentionally dropped — see WinMain.cpp), so the usual
 		// "-mod" flag never reaches parseMod(). Provide env-var equivalents that
@@ -1026,7 +1038,18 @@ Bool GameEngine::canUpdateRegularGameLogic()
 {
 	const Bool enabled = TheFramePacer->isLogicTimeScaleEnabled();
 	const Int logicTimeScaleFps = TheFramePacer->getLogicTimeScaleFps();
+#if defined(__APPLE__)
+	// TheSuperHackers @port macOS @bugfix: compare against the render cap that is
+	// actually applied (GEN_FPS_CAP), not m_maxFPS. The engine sets m_maxFPS to 30
+	// in many game states, so with logic at 30 Hz the test below took the "update
+	// straight away" branch and stepped logic once per rendered frame: at a 120 FPS
+	// cap the game ran 4x fast.
+	const Int maxRenderFps = TheFramePacer->isMacHighFpsMode()
+		? TheFramePacer->getActualFramesPerSecondLimit()
+		: TheFramePacer->getFramesPerSecondLimit();
+#else
 	const Int maxRenderFps = TheFramePacer->getFramesPerSecondLimit();
+#endif
 
 #if defined(_ALLOW_DEBUG_CHEATS_IN_RELEASE)
 	const Bool useFastMode = TheGlobalData->m_TiVOFastMode;
